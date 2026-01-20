@@ -1,3 +1,10 @@
+"""
+ETA extraction from chat messages.
+
+This module extracts simple ETAs such as EOD or explicit dates when users mention "by <date>",
+and stores them in incident state so the pinned summary shows expected timelines.
+"""
+
 import re
 from datetime import datetime
 from vocabulary.incident_vocabulary import ETA_PHRASES, EOD_KEYWORDS

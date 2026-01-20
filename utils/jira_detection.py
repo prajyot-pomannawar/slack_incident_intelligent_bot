@@ -1,3 +1,10 @@
+"""
+Jira reference extraction from chat messages.
+
+This module detects Jira issue keys (e.g., ABC-123) or Jira browse URLs and extracts the ticket id,
+so the incident summary can show which Jira item is linked to the incident.
+"""
+
 import re
 
 JIRA_KEY_REGEX = r"\b[A-Z]{2,10}-\d+\b"

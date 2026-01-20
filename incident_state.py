@@ -1,3 +1,10 @@
+"""
+In-memory incident state store.
+
+This module maintains per-channel incident state (severity/status/owner/actions/etc.)
+and provides small helpers to mutate state and append timeline events.
+"""
+
 # -----------------------------
 # In-memory incident store
 # -----------------------------
@@ -11,10 +18,13 @@ def start_incident(channel):
     _INCIDENTS[channel] = {
         "severity": "P1",
         "status": "Investigating",
+        "abstract": "TBD",
         "owner": "TBD",
         "eta": "TBD",
         "jira_id": None,
+        # List of action items. Each item is a dict (see utils/action_items.py).
         "actions": [],
+        "next_action_id": 1,
         "links": [],  # ✅ NEW
         "timeline": [],
         "pending_owner_request": None,

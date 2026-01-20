@@ -1,5 +1,13 @@
+"""
+Slack Incident Intelligence Bot (main entrypoint).
+
+This file wires Slack events/commands/actions to the bot's incident-tracking logic,
+updates in-memory state, and keeps a pinned incident summary refreshed in the channel.
+"""
+
 import os
 import re
+import time
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
@@ -10,16 +18,25 @@ from utils.action_detection import extract_action
 from utils.eta_detection import extract_eta
 from utils.status_detection import extract_status
 from utils.jira_detection import extract_jira_id
-from summary_renderer import render_summary
+from summary_renderer import render_summary, render_summary_blocks, render_summary_text
 from utils.incident_classifier import classify_incident_intent
 from utils.confirmation import ask_incident_confirmation
 from utils.link_detection import extract_links
+from utils.abstract_detection import extract_abstract
+from utils.action_items import (
+    add_action_item,
+    infer_owner_from_text,
+    normalize_actions,
+    split_actions,
+    update_action_item,
+)
 
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
 # Track pinned summary per channel
 PINNED_MESSAGES = {}
+# channel_id -> detected message line (for MEDIUM confirmation flows)
 pending_confirmations = {}
 
 # -----------------------------
@@ -58,7 +75,7 @@ def handle_message(event, client):
                 and channel not in pending_confirmations
             ):
                 ask_incident_confirmation(client, channel, line)
-                pending_confirmations[channel] = True
+                pending_confirmations[channel] = line
 
             return  # ⛔ stop further processing
 
@@ -70,10 +87,21 @@ def handle_message(event, client):
     # STEP 2: Normal incident processing
     # -----------------------------
     state = incident_state.get_state(channel)
+    normalize_actions(state)
     updated = False
 
     for line in lines:
         l = line.lower()
+
+        # -----------------------------
+        # Abstract (short one-liner) detection
+        # -----------------------------
+        if (not state.get("abstract")) or state.get("abstract") == "TBD":
+            abstract = extract_abstract(line)
+            if abstract:
+                state["abstract"] = abstract
+                incident_state.add_timeline_event(channel, f"Abstract set to {abstract}")
+                updated = True
 
         # -----------------------------
         # Owner QUESTION detection
@@ -173,13 +201,20 @@ def handle_message(event, client):
         # Action detection
         # -----------------------------
         action = extract_action(line, sender)
-        if action and action not in state["actions"]:
-            state["actions"].append(action)
+        if action:
+            # Create a structured action item; infer owner/due from text if possible.
+            # NOTE: Don't default owner to the sender. If the message doesn't explicitly
+            # assign someone, keep owner as None (can be set later via modal).
+            owner = infer_owner_from_text(action)
+            due = extract_eta(line)  # lightweight reuse; ok if None
 
-            incident_state.add_timeline_event(
-                channel, f"Action added: {action}"
-            )
+            # De-dupe by text among OPEN actions
+            open_items, _done_items = split_actions(state)
+            if any((a.get("text") or "") == action for a in open_items):
+                continue
 
+            item = add_action_item(state, action, created_by=sender, owner=owner, due=due)
+            incident_state.add_timeline_event(channel, f"Action added: #{item['id']}")
             updated = True
             continue
 
@@ -187,18 +222,21 @@ def handle_message(event, client):
     # FINAL: Render / update summary
     # -----------------------------
     if updated or incident_started:
-        summary_text = render_summary(state)
+        summary_text = render_summary_text(state)
+        summary_blocks = render_summary_blocks(state, channel_id=channel)
 
         if channel in PINNED_MESSAGES:
             client.chat_update(
                 channel=channel,
                 ts=PINNED_MESSAGES[channel],
-                text=summary_text
+                text=summary_text,
+                blocks=summary_blocks,
             )
         else:
             msg = client.chat_postMessage(
                 channel=channel,
-                text=summary_text
+                text=summary_text,
+                blocks=summary_blocks,
             )
             client.pins_add(channel=channel, timestamp=msg["ts"])
             PINNED_MESSAGES[channel] = msg["ts"]
@@ -236,7 +274,8 @@ def resolve_incident(ack, body, client, logger):
             client.chat_update(
                 channel=channel,
                 ts=PINNED_MESSAGES[channel],
-                text=render_summary(state)
+                text=render_summary_text(state),
+                blocks=render_summary_blocks(state, channel_id=channel),
             )
 
             # Unpin
@@ -275,12 +314,22 @@ def confirm_incident(ack, body, client):
             channel, "Incident confirmed by user"
         )
 
-    pending_confirmations.pop(channel, None)
+    detected_line = pending_confirmations.pop(channel, None)
 
     state = incident_state.get_state(channel)
-    summary = render_summary(state)
+    normalize_actions(state)
 
-    msg = client.chat_postMessage(channel=channel, text=summary)
+    # Try to set abstract from the originally detected line (MEDIUM flow)
+    if detected_line and ((not state.get("abstract")) or state.get("abstract") == "TBD"):
+        abstract = extract_abstract(detected_line)
+        if abstract:
+            state["abstract"] = abstract
+            incident_state.add_timeline_event(channel, f"Abstract set to {abstract}")
+
+    summary = render_summary_text(state)
+    summary_blocks = render_summary_blocks(state, channel_id=channel)
+
+    msg = client.chat_postMessage(channel=channel, text=summary, blocks=summary_blocks)
     client.pins_add(channel=channel, timestamp=msg["ts"])
     PINNED_MESSAGES[channel] = msg["ts"]
 
@@ -295,6 +344,226 @@ def ignore_incident(ack, body):
     ack()
     channel = body["channel"]["id"]
     pending_confirmations.pop(channel, None)
+
+
+# -----------------------------
+# Manage Actions (Modal)
+# -----------------------------
+@app.action("manage_actions")
+def manage_actions(ack, body, client, logger):
+    ack()
+
+    try:
+        channel = body["channel"]["id"]
+        trigger_id = body.get("trigger_id")
+        if not trigger_id:
+            return
+
+        if not incident_state.is_active(channel):
+            client.chat_postEphemeral(
+                channel=channel,
+                user=body["user"]["id"],
+                text="⚠️ No active incident in this channel.",
+            )
+            return
+
+        state = incident_state.get_state(channel)
+        normalize_actions(state)
+
+        # Build options for existing actions
+        options = []
+        for a in state.get("actions", [])[-100:]:
+            try:
+                aid = a.get("id")
+                status = a.get("status", "open")
+                text = (a.get("text") or "").strip()
+                label = f"#{aid} [{status}] {text}"[:75]
+                options.append(
+                    {
+                        "text": {"type": "plain_text", "text": label},
+                        "value": str(aid),
+                    }
+                )
+            except Exception:
+                continue
+
+        view = {
+            "type": "modal",
+            "callback_id": "manage_actions_modal",
+            "private_metadata": channel,
+            "title": {"type": "plain_text", "text": "Manage Actions"},
+            "submit": {"type": "plain_text", "text": "Save"},
+            "close": {"type": "plain_text", "text": "Cancel"},
+            "blocks": [
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": "Add a new action item, or edit an existing one (owner, due date, status).",
+                    },
+                },
+                {"type": "divider"},
+                {
+                    "type": "input",
+                    "block_id": "edit_select",
+                    "optional": True,
+                    "label": {"type": "plain_text", "text": "Select action to edit"},
+                    "element": {
+                        "type": "static_select",
+                        "action_id": "selected_action",
+                        "placeholder": {"type": "plain_text", "text": "Choose an action"},
+                        "options": options or [
+                            {
+                                "text": {"type": "plain_text", "text": "No actions yet"},
+                                "value": "0",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "type": "input",
+                    "block_id": "edit_owner",
+                    "optional": True,
+                    "label": {"type": "plain_text", "text": "Edit owner"},
+                    "element": {"type": "users_select", "action_id": "owner"},
+                },
+                {
+                    "type": "input",
+                    "block_id": "edit_due",
+                    "optional": True,
+                    "label": {"type": "plain_text", "text": "Edit due date"},
+                    "element": {"type": "datepicker", "action_id": "due"},
+                },
+                {
+                    "type": "input",
+                    "block_id": "edit_status",
+                    "optional": True,
+                    "label": {"type": "plain_text", "text": "Edit status"},
+                    "element": {
+                        "type": "static_select",
+                        "action_id": "status",
+                        "placeholder": {"type": "plain_text", "text": "Open or Done"},
+                        "options": [
+                            {"text": {"type": "plain_text", "text": "Open"}, "value": "open"},
+                            {"text": {"type": "plain_text", "text": "Done"}, "value": "done"},
+                        ],
+                    },
+                },
+                {"type": "divider"},
+                {
+                    "type": "input",
+                    "block_id": "new_text",
+                    "optional": True,
+                    "label": {"type": "plain_text", "text": "Add new action item"},
+                    "element": {
+                        "type": "plain_text_input",
+                        "action_id": "text",
+                        "placeholder": {"type": "plain_text", "text": "e.g. Investigate WebUI bug in login flow"},
+                    },
+                },
+                {
+                    "type": "input",
+                    "block_id": "new_owner",
+                    "optional": True,
+                    "label": {"type": "plain_text", "text": "New action owner (optional)"},
+                    "element": {"type": "users_select", "action_id": "owner"},
+                },
+                {
+                    "type": "input",
+                    "block_id": "new_due",
+                    "optional": True,
+                    "label": {"type": "plain_text", "text": "New action due date (optional)"},
+                    "element": {"type": "datepicker", "action_id": "due"},
+                },
+            ],
+        }
+
+        # Network/proxy environments can cause transient TLS EOFs. Retry quickly
+        # within the trigger_id validity window.
+        last_err = None
+        for attempt in range(3):
+            try:
+                client.views_open(trigger_id=trigger_id, view=view)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                # Short backoff; keep under trigger_id expiry.
+                time.sleep(0.25 * (attempt + 1))
+
+        if last_err is not None:
+            raise last_err
+
+    except Exception:
+        logger.exception("Failed to open Manage Actions modal")
+
+
+@app.view("manage_actions_modal")
+def manage_actions_submit(ack, body, client, logger, view):
+    ack()
+
+    try:
+        channel = (view.get("private_metadata") or "").strip()
+        if not channel:
+            return
+
+        if not incident_state.is_active(channel):
+            return
+
+        state = incident_state.get_state(channel)
+        normalize_actions(state)
+
+        values = (view.get("state") or {}).get("values") or {}
+
+        def _val(block_id: str, action_id: str):
+            b = values.get(block_id) or {}
+            a = b.get(action_id) or {}
+            return a
+
+        # Add new action (if provided)
+        new_text = (_val("new_text", "text").get("value") or "").strip()
+        new_owner_id = _val("new_owner", "owner").get("selected_user")
+        new_due = _val("new_due", "due").get("selected_date")
+        created_by = f"<@{body['user']['id']}>"
+
+        if new_text:
+            new_owner = f"<@{new_owner_id}>" if new_owner_id else None
+            item = add_action_item(state, new_text, created_by=created_by, owner=new_owner, due=new_due)
+            incident_state.add_timeline_event(channel, f"Action added via modal: #{item['id']}")
+
+        # Edit existing action (if selected)
+        selected = _val("edit_select", "selected_action").get("selected_option")
+        if selected and selected.get("value") and selected.get("value") != "0":
+            action_id = int(selected["value"])
+            owner_id = _val("edit_owner", "owner").get("selected_user")
+            due = _val("edit_due", "due").get("selected_date")
+            status_opt = _val("edit_status", "status").get("selected_option")
+            status = status_opt.get("value") if status_opt else None
+
+            owner = f"<@{owner_id}>" if owner_id else None
+            updated_item = update_action_item(
+                state,
+                action_id,
+                owner=owner,
+                due=due,
+                status=status,
+                done_by=created_by,
+            )
+            if updated_item:
+                incident_state.add_timeline_event(channel, f"Action updated via modal: #{action_id}")
+
+        # Update pinned summary message
+        if channel in PINNED_MESSAGES:
+            summary_text = render_summary_text(state)
+            client.chat_update(
+                channel=channel,
+                ts=PINNED_MESSAGES[channel],
+                text=summary_text,
+                blocks=render_summary_blocks(state, channel_id=channel),
+            )
+
+    except Exception:
+        logger.exception("Failed to submit Manage Actions modal")
 
 # -----------------------------
 # App mention

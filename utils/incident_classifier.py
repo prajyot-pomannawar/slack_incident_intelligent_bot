@@ -1,3 +1,10 @@
+"""
+Rule-based incident intent classifier.
+
+This module maps a single message line to HIGH/MEDIUM/LOW using keyword heuristics.
+It is used as the primary gate before starting incident tracking or asking for confirmation.
+"""
+
 # utils/incident_classifier.py
 
 from vocabulary.incident_vocabulary import INCIDENT_KEYWORDS, URGENCY_KEYWORDS

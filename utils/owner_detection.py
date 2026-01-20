@@ -1,3 +1,10 @@
+"""
+Owner detection and ownership-question detection.
+
+This module recognizes when someone assigns/accepts ownership of an incident (or asks someone to take it),
+so the incident state can track the current owner and prompt for confirmation when needed.
+"""
+
 import re
 from vocabulary.incident_vocabulary import OWNER_ASSIGNMENT_PHRASES, ASSIGNMENT_QUESTION_PHRASES
 

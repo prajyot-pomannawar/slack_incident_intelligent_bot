@@ -1,3 +1,10 @@
+"""
+Slack confirmation UI for MEDIUM-confidence incidents.
+
+This module posts an interactive message with buttons (Track / Ignore) to let humans confirm
+whether the bot should start tracking a probable incident in the channel.
+"""
+
 # utils/confirmation.py
 
 
